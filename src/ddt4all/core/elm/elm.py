@@ -418,6 +418,10 @@ class ELM:
 
     connectionStatus = False
 
+    # CAN bus speed (500 or 250 kbit/s) found by detect_can_speed(); None = not detected yet
+    detected_can_speed = None
+    can_speed_detection_done = False
+
     def __init__(self, portName, rate, adapter_type, maxspeed="No"):
         self.adapter_type = adapter_type
         options.port_speed = rate
@@ -1596,6 +1600,65 @@ class ELM:
             self.port.write("AT\r".encode('utf-8'))
             self.port.expect('>')
 
+    def _count_monitored_frames(self, listen_time):
+        """Run AT MA for listen_time seconds and return the number of CAN frames received."""
+        if self.lf != 0:
+            tmstr = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            self.lf.write("> [" + tmstr + "] Request: AT MA (listen %.1f s)\n" % listen_time)
+            self.lf.flush()
+        self.port.write("AT MA\r".encode("utf-8"))
+        received = ""
+        deadline = time.time() + listen_time
+        while time.time() < deadline:
+            byte = self.port.read()
+            if byte:
+                received += byte
+            else:
+                time.sleep(0.001)
+        # Any character stops monitoring; wait for the prompt
+        self.port.write("\r".encode("utf-8"))
+        received += self.port.expect('>', 2)
+        frames = 0
+        for line in received.replace('\r', '\n').split('\n'):
+            if re.match(r'^[0-9A-F]{3,8}( [0-9A-F]{2})+$', line.strip().upper()):
+                frames += 1
+        if self.lf != 0:
+            self.lf.write("< Response: %d frames\n" % frames)
+            self.lf.flush()
+        return frames
+
+    def detect_can_speed(self, listen_time=0.3):
+        """Detect the CAN bus speed at the diagnostic socket by listening silently.
+
+        Some vehicles run the diagnostic CAN at 250 kbit/s instead of 500 kbit/s
+        (e.g. Renault Espace IV ph2). With silent monitoring (AT CSM1) the adapter
+        does not transmit or acknowledge anything, so a wrong speed cannot disturb
+        the bus. Returns 500, 250, or None when no traffic was seen at either speed.
+        The result is kept for the rest of the adapter session.
+        """
+        if options.simulation_mode or self.can_speed_detection_done:
+            return self.detected_can_speed
+
+        self.can_speed_detection_done = True
+        self.cmd("AT CSM1")  # silent monitoring
+        self.cmd("AT AR")  # clear any receive address filter
+        self.cmd("AT H1")  # headers on, so frames can be recognised
+        for protocol, speed in (("6", 500), ("8", 250)):
+            self.cmd("AT SP " + protocol)
+            if self._count_monitored_frames(listen_time) > 0:
+                self.detected_can_speed = speed
+                break
+        self.cmd("AT H0")
+
+        if self.detected_can_speed:
+            print(_("CAN bus speed detected: %i kbit/s") % self.detected_can_speed)
+        else:
+            print(_("CAN bus speed not detected, using 500 kbit/s"))
+        if self.lf != 0:
+            self.lf.write("# CAN bus speed detected: %s\n" % self.detected_can_speed)
+            self.lf.flush()
+        return self.detected_can_speed
+
     def init_can(self):
         self.currentprotocol = "can"
         self.currentaddress = "7e0"  # init add not change this
@@ -1695,6 +1758,11 @@ class ELM:
                     ecu['brp'] = '1'  # brp = 1
             else:  # not double brp
                 if 'brp' in list(ecu.keys()) and '1' in ecu['brp']:
+                    self.set_can_250(TXa)
+                elif 'brp' in list(ecu.keys()) or options.opt_can2:
+                    self.set_can_500(TXa)
+                elif self.detect_can_speed() == 250:
+                    # No speed given for this ECU: use the speed found on the bus
                     self.set_can_250(TXa)
                 else:
                     self.set_can_500(TXa)
